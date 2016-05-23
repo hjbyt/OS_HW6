@@ -16,11 +16,6 @@
 #include <signal.h>
 
 //
-// TODO:
-//      - on client error, stop handling client instead of exiting completely
-//
-
-//
 // Macros
 //
 
@@ -45,7 +40,7 @@
 // If there is an error, propagate it.
 #define PROPAGATE(condition) if (!(condition)) goto end
 
-//TODO: comment out
+//TODO: comment out?
 #define ENABLE_DEBUG_PRINTS
 
 #ifdef ENABLE_DEBUG_PRINTS
@@ -53,6 +48,8 @@
 #else
 #define PRINTF
 #endif
+
+#define WARN_UNUSED __attribute__((warn_unused_result))
 
 //
 // Constants
@@ -68,8 +65,7 @@ typedef int bool;
 #define DEFAULT_HTTP_PORT 80
 
 #define REQUEST_MAX_SIZE 8192
-
-#define HTTP_OK "HTTP/1.0 200 OK\n\n"
+#define STATUS_LINE_MAX_LENGTH 1024
 
 //
 // Structs
@@ -85,16 +81,18 @@ int listen_fd = -1;
 // Function Declarations
 //
 
-bool register_signal_handlers();
+bool register_signal_handlers() WARN_UNUSED;
 void kill_signal_handler(int signum);
-bool init(int port, int workers_count);
+bool init(int port, int workers_count) WARN_UNUSED;
 void uninit();
-bool serve();
-bool handle_request(int client_fd);
+bool serve() WARN_UNUSED;
+bool handle_request(int client_fd) WARN_UNUSED;
 char* parse_request(char* request, int length, bool* is_post);
-bool handle_post_request(int client_fd, const char* path);
-bool handle_get_request(int client_fd, const char* path);
-bool write_all(int fd, void* data, int size);
+bool handle_post_request(int client_fd, const char* path) WARN_UNUSED;
+bool handle_get_request(int client_fd, const char* path) WARN_UNUSED;
+bool send_response(int fd, int status, const char* reason, char* body) WARN_UNUSED;
+bool send_status_line(int fd, int status, const char* reason) WARN_UNUSED;
+bool write_all(int fd, void* data, int size) WARN_UNUSED;
 
 //
 // Implementation
@@ -169,6 +167,7 @@ bool init(int port, int workers_count)
 	bool success = FALSE;
 
 	assert(workers_count >= 1);
+	//TODO: use SO_REUSEADDR ??
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	VERIFY(listen_fd != -1, "create socket failed");
 
@@ -204,11 +203,13 @@ bool serve()
 	int client_fd = accept(listen_fd, NULL, NULL);
 	VERIFY(client_fd != -1, "accept failed");
 
-	PROPAGATE(handle_request(client_fd));
+	if (!handle_request(client_fd)) {
+		PROPAGATE(send_response(client_fd, 500, "Internal Server Error", "Internal Server Error"));
+	}
 
 	success = TRUE;
 end:
-	if (client_fd != -1 ) close(client_fd);
+	if (client_fd != -1) close(client_fd);
 	return success;
 }
 
@@ -219,20 +220,27 @@ bool handle_request(int client_fd)
 	char* buffer = (char*)malloc(REQUEST_MAX_SIZE);
 	VERIFY(buffer != NULL, "malloc failed");
 
-	//TODO: read with a while loop ?
 	int bytes_read = read(client_fd, buffer, REQUEST_MAX_SIZE);
 	VERIFY(bytes_read != -1, "read from client socket failed");
-	CHECK(bytes_read != 0, "client disconnected unexpectedly");
-	PRINTF("request: %s\n", buffer);
+	if (bytes_read == REQUEST_MAX_SIZE) {
+		//TODO: is this the right thing to do?
+		PROPAGATE(send_response(client_fd, 414, "Request-URI Too Large", "Request to long"));
+		success = TRUE;
+		goto end;
+	}
 
 	bool is_post;
 	char* path = parse_request(buffer, bytes_read, &is_post);
-	CHECK(path != NULL, "invalid request");
+	if (path == NULL) {
+		PROPAGATE(send_response(client_fd, 400, "Bad Request", "Bad Request"));
+		success = TRUE;
+		goto end;
+	}
 
 	if (is_post) {
-		handle_post_request(client_fd, path);
+		PROPAGATE(handle_post_request(client_fd, path));
 	} else {
-		handle_get_request(client_fd, path);
+		PROPAGATE(handle_get_request(client_fd, path));
 	}
 
 	success = TRUE;
@@ -272,10 +280,14 @@ bool handle_get_request(int client_fd, const char* path)
 	PRINTF("Get (%s)\n", path);
 
 	if (stat(path, &path_stat) == -1) {
-		if (errno == ENOENT) {
-			// TODO: send 404 not found
+		if (errno == ENOENT || errno == ENOTDIR) {
+			PROPAGATE(send_response(client_fd, 404, "Not Found", "Requested file/directory not found."));
+			success = TRUE;
+		} else if (errno == EACCES) {
+			PROPAGATE(send_response(client_fd, 403, "Forbidden", "Access denied."));
+			success = TRUE;
 		} else {
-			// TODO: return 500 internal error
+			perror("stat reqeusted file failed");
 		}
 		goto end;
 	}
@@ -284,15 +296,24 @@ bool handle_get_request(int client_fd, const char* path)
 
 	fd = open(path, O_RDONLY);
 	if (fd == -1) {
-		// TODO: send 500 internal error
+		if (errno == ENOENT || errno == ENOTDIR) {
+			PROPAGATE(send_response(client_fd, 404, "Not Found", "Requested file/directory not found."));
+			success = TRUE;
+		} else if (errno == EACCES) {
+			PROPAGATE(send_response(client_fd, 403, "Forbidden", "Access denied."));
+			success = TRUE;
+		} else {
+			perror("open reqeusted file failed");
+		}
 		goto end;
 	}
+	VERIFY(fd != -1, "open requested file failed");
 
 	buffer = (char*)malloc(MEGA);
 	VERIFY(buffer != NULL, "malloc failed");
 	int bytes_read = 0;
 	PRINTF("Send file\n");
-	write_all(client_fd, HTTP_OK, ARRAY_LENGTH(HTTP_OK) - 1);
+	PROPAGATE(send_status_line(client_fd, 200, "OK"));
 	while (TRUE)
 	{
 		bytes_read = read(fd, buffer, MEGA);
@@ -300,13 +321,44 @@ bool handle_get_request(int client_fd, const char* path)
 		if (bytes_read == 0) {
 			break;
 		}
-		write_all(client_fd, buffer, bytes_read);
+		PROPAGATE(write_all(client_fd, buffer, bytes_read));
 	}
 
 	success = TRUE;
 end:
 	if (buffer != NULL) free(buffer);
 	if (fd != -1) close(fd);
+	return success;
+}
+
+bool send_response(int fd, int status, const char* reason, char* body)
+{
+	bool success = FALSE;
+
+	PRINTF("Send response (status=%d, reason=%s)\n", status, reason);
+	PROPAGATE(send_status_line(fd, status, reason));
+	PROPAGATE(write_all(fd, body, strlen(body)));
+
+	success = TRUE;
+end:
+	return success;
+}
+
+bool send_status_line(int fd, int status, const char* reason)
+{
+	bool success = FALSE;
+	assert(reason != NULL);
+	assert(strlen(reason) <= 500);
+	assert(status >= 0 && status <= 10000);
+
+	char* status_line = (char*)malloc(STATUS_LINE_MAX_LENGTH);
+	VERIFY(snprintf(status_line, STATUS_LINE_MAX_LENGTH - 1, "HTTP/1.1 %d %s\r\n\r\n", status, reason) > 0,
+			"snprintf failed");
+	PROPAGATE(write_all(fd, status_line, strlen(status_line)));
+
+	success = TRUE;
+end:
+	if (status_line != NULL) free(status_line);
 	return success;
 }
 
