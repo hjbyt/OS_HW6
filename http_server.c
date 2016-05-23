@@ -1,3 +1,7 @@
+//
+// TODO: document, explain...
+//
+
 #include <stdio.h>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -9,11 +13,21 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <error.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+
+//
+// TODO: - change the special errors (414, 403, etc) to 500 ?
+//       - implement multiple threads
+//       - return HTML body in all responses?
+//       - what if a 200 OK is sent, but then there is an error reading the file / direcory?
+//         maybe we should prepare the body in advance, and send all at once.
+//
 
 //
 // Macros
@@ -49,6 +63,7 @@
 #define PRINTF
 #endif
 
+//TODO: remove / ifdef DEBUG ?
 #define WARN_UNUSED __attribute__((warn_unused_result))
 
 //
@@ -90,9 +105,12 @@ bool handle_request(int client_fd) WARN_UNUSED;
 char* parse_request(char* request, int length, bool* is_post);
 bool handle_post_request(int client_fd, const char* path) WARN_UNUSED;
 bool handle_get_request(int client_fd, const char* path) WARN_UNUSED;
+bool send_file(int client_fd, const char* file_path) WARN_UNUSED;
+bool send_dir_list(int client_fd, const char* dir_path) WARN_UNUSED;
 bool send_response(int fd, int status, const char* reason, char* body) WARN_UNUSED;
 bool send_status_line(int fd, int status, const char* reason) WARN_UNUSED;
-bool write_all(int fd, void* data, int size) WARN_UNUSED;
+bool write_all(int fd, const void* data, int size) WARN_UNUSED;
+size_t dirent_buf_size(DIR * dirp);
 
 //
 // Implementation
@@ -146,9 +164,10 @@ bool register_signal_handlers()
 	if (sigaction(SIGINT, &kill_action, NULL) == -1) {
 		ERROR("Error, sigaction failed");
 	}
-	if (sigaction(SIGTERM, &kill_action, NULL) == -1) {
-		ERROR("Error, sigaction failed");
-	}
+	//TODO: uncomment?
+//	if (sigaction(SIGTERM, &kill_action, NULL) == -1) {
+//		ERROR("Error, sigaction failed");
+//	}
 
 	success = TRUE;
 
@@ -198,9 +217,10 @@ void uninit()
 bool serve()
 {
 	bool success = FALSE;
+	int client_fd = -1;
 
 	PRINTF("wait for connection\n");
-	int client_fd = accept(listen_fd, NULL, NULL);
+	client_fd = accept(listen_fd, NULL, NULL);
 	VERIFY(client_fd != -1, "accept failed");
 
 	if (!handle_request(client_fd)) {
@@ -216,8 +236,9 @@ end:
 bool handle_request(int client_fd)
 {
 	bool success = FALSE;
-	PRINTF("got request\n");
-	char* buffer = (char*)malloc(REQUEST_MAX_SIZE);
+	char* buffer = NULL;
+
+	buffer = (char*)malloc(REQUEST_MAX_SIZE);
 	VERIFY(buffer != NULL, "malloc failed");
 
 	int bytes_read = read(client_fd, buffer, REQUEST_MAX_SIZE);
@@ -262,12 +283,15 @@ char* parse_request(char* request, int length, bool* is_post)
 	} else {
 		return NULL;
 	}
+	//TODO: recognize other http methods, in order to return 501.
+	//TODO: check the HTTP-Version after the URL ?
 
 	return strtok(s, " ");
 }
 
 bool handle_post_request(int client_fd, const char* path)
 {
+	//TODO: implement
 	return FALSE;
 }
 
@@ -275,12 +299,11 @@ bool handle_get_request(int client_fd, const char* path)
 {
 	bool success = FALSE;
 	struct stat path_stat;
-	int fd = -1;
-	char* buffer = NULL;
 	PRINTF("Get (%s)\n", path);
 
 	if (stat(path, &path_stat) == -1) {
 		if (errno == ENOENT || errno == ENOTDIR) {
+			//TODO: return simple HTML body?
 			PROPAGATE(send_response(client_fd, 404, "Not Found", "Requested file/directory not found."));
 			success = TRUE;
 		} else if (errno == EACCES) {
@@ -292,9 +315,27 @@ bool handle_get_request(int client_fd, const char* path)
 		goto end;
 	}
 
-	// TODO: check if is file / dir
+	if (S_ISDIR(path_stat.st_mode)) {
+		PROPAGATE(send_dir_list(client_fd, path));
+	} else {
+		//TODO: is this the right thing to do?
+		//      should check S_ISREG(path_stat.st_mode)?
+		PROPAGATE(send_file(client_fd, path));
+	}
 
-	fd = open(path, O_RDONLY);
+	success = TRUE;
+end:
+	return success;
+}
+
+bool send_file(int client_fd, const char* file_path)
+{
+	bool success = FALSE;
+	int fd = -1;
+	char* buffer = NULL;
+	PRINTF("Get (%s)\n", file_path);
+
+	fd = open(file_path, O_RDONLY);
 	if (fd == -1) {
 		if (errno == ENOENT || errno == ENOTDIR) {
 			PROPAGATE(send_response(client_fd, 404, "Not Found", "Requested file/directory not found."));
@@ -303,7 +344,7 @@ bool handle_get_request(int client_fd, const char* path)
 			PROPAGATE(send_response(client_fd, 403, "Forbidden", "Access denied."));
 			success = TRUE;
 		} else {
-			perror("open reqeusted file failed");
+			perror("open requested file failed");
 		}
 		goto end;
 	}
@@ -331,6 +372,61 @@ end:
 	return success;
 }
 
+//TODO: send HTML body (?)
+//TODO: send in MEGA chunks, and not line by line (?)
+bool send_dir_list(int client_fd, const char* dir_path)
+{
+	bool success = FALSE;
+	DIR *dir = NULL;
+	struct dirent* buffer = NULL;
+
+	dir = opendir(dir_path);
+	if (dir == NULL) {
+		if (errno == ENOENT) {
+			PROPAGATE(send_response(client_fd, 404, "Not Found", "Requested file/directory not found."));
+			success = TRUE;
+		} else if (errno == EACCES) {
+			PROPAGATE(send_response(client_fd, 403, "Forbidden", "Access denied."));
+			success = TRUE;
+		} else {
+			perror("opendir failed");
+		}
+		goto end;
+	}
+
+	size_t buffer_size = dirent_buf_size(dir);
+	VERIFY(buffer_size != -1, "can't determine dirent_size of readdir_r buffer");
+	buffer = (struct dirent*)malloc(buffer_size);
+	VERIFY(buffer != NULL, "malloc failed");
+
+	PROPAGATE(send_status_line(client_fd, 200, "OK"));
+	struct dirent* enrty;
+	int readdir_error = 0;
+	while ((readdir_error = readdir_r(dir, buffer, &enrty)) == 0 && enrty != NULL)
+	{
+		if (strcmp(enrty->d_name, ".") == 0 || strcmp(enrty->d_name, "..") == 0) {
+			continue;
+		}
+
+		PRINTF("name: %s (%d)\n", enrty->d_name, strlen(enrty->d_name));
+		PROPAGATE(write_all(client_fd, enrty->d_name, strlen(enrty->d_name)));
+		//TODO: XXX
+		const char* new_line = "\n";
+		PROPAGATE(write_all(client_fd, new_line, strlen(new_line)));
+	}
+	if (readdir_error != 0)
+	{
+		errno = readdir_error;
+		VERIFY(FALSE, "readdir failed");
+	}
+
+	success = TRUE;
+end:
+	if (buffer != NULL) free(buffer);
+	if (dir != NULL) closedir(dir);
+	return success;
+}
+
 bool send_response(int fd, int status, const char* reason, char* body)
 {
 	bool success = FALSE;
@@ -347,11 +443,12 @@ end:
 bool send_status_line(int fd, int status, const char* reason)
 {
 	bool success = FALSE;
+	char* status_line = NULL;
 	assert(reason != NULL);
 	assert(strlen(reason) <= 500);
 	assert(status >= 0 && status <= 10000);
 
-	char* status_line = (char*)malloc(STATUS_LINE_MAX_LENGTH);
+	status_line = (char*)malloc(STATUS_LINE_MAX_LENGTH);
 	VERIFY(snprintf(status_line, STATUS_LINE_MAX_LENGTH - 1, "HTTP/1.1 %d %s\r\n\r\n", status, reason) > 0,
 			"snprintf failed");
 	PROPAGATE(write_all(fd, status_line, strlen(status_line)));
@@ -362,17 +459,45 @@ end:
 	return success;
 }
 
-bool write_all(int fd, void* data, int size)
+bool write_all(int fd, const void* data, int size)
 {
 	bool success = FALSE;
 	assert(size >= 0);
+
 	while (size > 0) {
 		int bytes_written = write(fd, data, size);
 		VERIFY(bytes_written != -1, "write response failed");
 		size -= bytes_written;
 		assert(size >= 0);
 	}
+
 	success = TRUE;
 end:
 	return success;
+}
+
+// Taken from: https://womble.decadent.org.uk/readdir_r-advisory.html
+size_t dirent_buf_size(DIR * dirp)
+{
+    long name_max;
+    size_t name_end;
+#   if defined(HAVE_FPATHCONF) && defined(HAVE_DIRFD) \
+       && defined(_PC_NAME_MAX)
+        name_max = fpathconf(dirfd(dirp), _PC_NAME_MAX);
+        if (name_max == -1)
+#           if defined(NAME_MAX)
+                name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+#           else
+                return (size_t)(-1);
+#           endif
+#   else
+#       if defined(NAME_MAX)
+            name_max = (NAME_MAX > 255) ? NAME_MAX : 255;
+#       else
+#           error "buffer size for readdir_r cannot be determined"
+#       endif
+#   endif
+    name_end = (size_t)offsetof(struct dirent, d_name) + name_max + 1;
+    return (name_end > sizeof(struct dirent)
+            ? name_end : sizeof(struct dirent));
 }
