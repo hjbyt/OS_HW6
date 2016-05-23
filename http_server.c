@@ -33,6 +33,8 @@ typedef int bool;
 #define KILO 1024
 #define MEGA (KILO*KILO)
 
+#define DEFAULT_HTTP_PORT 80
+
 //
 // Structs
 //
@@ -55,6 +57,18 @@ int main(int argc, char** argv)
 	if (argc != 3 && argc != 2) {
 		printf("Usage: ./http_server <workers> [<port>]\n");
 		return EXIT_FAILURE;
+	}
+
+	errno = 0;
+	int workers_count = strtol(argv[1], NULL, 0);
+	VERIFY(errno == 0 && workers_count >= 1, "Invallid argument given as <workers>");
+	int port;
+	if (argc == 3) {
+		errno = 0;
+		port = strtol(argv[2], NULL, 0);
+		VERIFY(errno == 0 && port >= 0, "Invallid argument given as <port>");
+	} else {
+		port = DEFAULT_HTTP_PORT;
 	}
 
 	return EXIT_SUCCESS;
