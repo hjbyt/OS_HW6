@@ -399,16 +399,16 @@ bool send_dir_list(int client_fd, const char* dir_path)
 	buffer = (struct dirent*)malloc(buffer_size);
 	VERIFY(buffer != NULL, "malloc failed");
 
+	PRINTF("Send dir list\n");
 	PROPAGATE(send_status_line(client_fd, 200, "OK"));
 	struct dirent* enrty;
 	int readdir_error = 0;
 	while ((readdir_error = readdir_r(dir, buffer, &enrty)) == 0 && enrty != NULL)
 	{
-		if (strcmp(enrty->d_name, ".") == 0 || strcmp(enrty->d_name, "..") == 0) {
+		if (strcmp(enrty->d_name, ".") == 0
+				|| strcmp(enrty->d_name, "..") == 0) {
 			continue;
 		}
-
-		PRINTF("name: %s (%d)\n", enrty->d_name, strlen(enrty->d_name));
 		PROPAGATE(write_all(client_fd, enrty->d_name, strlen(enrty->d_name)));
 		//TODO: XXX
 		const char* new_line = "\n";
