@@ -13,10 +13,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 //
 // TODO:
-// 		- cleanup properly on (fatal) errors (close connection etc)
 //      - on client error, stop handling client instead of exiting completely
 //
 
@@ -24,14 +24,14 @@
 // Macros
 //
 
-//TODO: uncomment
-#define ENABLE_DEBUG_PRINTS
-
-
 // Return number of elements in static array
 #define ARRAY_LENGTH(array) (sizeof(array)/sizeof(array[0]))
 // Exit with an error message
-#define ERROR(...) error(EXIT_FAILURE, errno, __VA_ARGS__)
+#define ERROR(...)           \
+	do {                     \
+		perror(__VA_ARGS__); \
+		goto end;            \
+	} while (0)
 // Verify that a condition holds, else exit with an error.
 #define VERIFY(condition, ...) if (!(condition)) ERROR(__VA_ARGS__)
 // Check that a condition holds, else exit with an error (without referencing errno)
@@ -42,6 +42,11 @@
 			exit(EXIT_FAILURE);                  \
 		}                                        \
 	} while (0)
+// If there is an error, propagate it.
+#define PROPAGATE(condition) if (!(condition)) goto end
+
+//TODO: comment out
+#define ENABLE_DEBUG_PRINTS
 
 #ifdef ENABLE_DEBUG_PRINTS
 #define PRINTF printf
@@ -74,15 +79,22 @@ typedef int bool;
 // Globals
 //
 
+int listen_fd = -1;
+
 //
 // Function Declarations
 //
 
-void handle_request(int client_fd);
+bool register_signal_handlers();
+void kill_signal_handler(int signum);
+bool init(int port, int workers_count);
+void uninit();
+bool serve();
+bool handle_request(int client_fd);
 char* parse_request(char* request, int length, bool* is_post);
-void handle_post_request(int client_fd, const char* path);
-void handle_get_request(int client_fd, const char* path);
-void write_all(int fd, void* data, int size);
+bool handle_post_request(int client_fd, const char* path);
+bool handle_get_request(int client_fd, const char* path);
+bool write_all(int fd, void* data, int size);
 
 //
 // Implementation
@@ -90,6 +102,7 @@ void write_all(int fd, void* data, int size);
 
 int main(int argc, char** argv)
 {
+	int return_value = EXIT_FAILURE;
 	if (argc != 3 && argc != 2) {
 		printf("Usage: ./http_server <workers> [<port>]\n");
 		return EXIT_FAILURE;
@@ -107,7 +120,56 @@ int main(int argc, char** argv)
 		port = DEFAULT_HTTP_PORT;
 	}
 
-	int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	PROPAGATE(init(port, workers_count));
+
+	PRINTF("Server started\n");
+	while (TRUE)
+	{
+		PROPAGATE(serve());
+	}
+
+	return_value = EXIT_SUCCESS;
+end:
+	uninit();
+	return return_value;
+}
+
+bool register_signal_handlers()
+{
+	bool success = FALSE;
+
+	struct sigaction kill_action;
+	kill_action.sa_handler = kill_signal_handler;
+	if (sigemptyset(&kill_action.sa_mask) == -1) {
+		ERROR("Error calling sigemptyset");
+	}
+	kill_action.sa_flags = 0;
+
+	if (sigaction(SIGINT, &kill_action, NULL) == -1) {
+		ERROR("Error, sigaction failed");
+	}
+	if (sigaction(SIGTERM, &kill_action, NULL) == -1) {
+		ERROR("Error, sigaction failed");
+	}
+
+	success = TRUE;
+
+end:
+	return success;
+}
+
+void kill_signal_handler(int signum)
+{
+	uninit();
+	exit(EXIT_SUCCESS);
+}
+
+bool init(int port, int workers_count)
+{
+	bool success = FALSE;
+
+	assert(workers_count >= 1);
+	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	VERIFY(listen_fd != -1, "create socket failed");
 
 	struct sockaddr_in server_address;
@@ -118,24 +180,41 @@ int main(int argc, char** argv)
 	VERIFY(bind(listen_fd, (struct sockaddr*)&server_address, sizeof(server_address)) != -1, "bind failed");
 	VERIFY(listen(listen_fd, workers_count) != -1, "listen failed");
 
-	PRINTF("Server started\n");
-	while (TRUE)
-	{
-		//TODO: use select() ?
-		PRINTF("wait for connection\n");
-		int client_fd = accept(listen_fd, NULL, NULL);
-		VERIFY(client_fd != -1, "accept failed");
-
-		handle_request(client_fd);
-
-		close(client_fd);
+	success = TRUE;
+end:
+	if (!success) {
+		uninit();
 	}
-
-	return EXIT_SUCCESS;
+	return success;
 }
 
-void handle_request(int client_fd)
+void uninit()
 {
+	if (listen_fd != -1) {
+		close(listen_fd);
+		listen_fd = -1;
+	}
+}
+
+bool serve()
+{
+	bool success = FALSE;
+
+	PRINTF("wait for connection\n");
+	int client_fd = accept(listen_fd, NULL, NULL);
+	VERIFY(client_fd != -1, "accept failed");
+
+	PROPAGATE(handle_request(client_fd));
+
+	success = TRUE;
+end:
+	if (client_fd != -1 ) close(client_fd);
+	return success;
+}
+
+bool handle_request(int client_fd)
+{
+	bool success = FALSE;
 	PRINTF("got request\n");
 	char* buffer = (char*)malloc(REQUEST_MAX_SIZE);
 	VERIFY(buffer != NULL, "malloc failed");
@@ -156,7 +235,10 @@ void handle_request(int client_fd)
 		handle_get_request(client_fd, path);
 	}
 
-	free(buffer);
+	success = TRUE;
+end:
+	if (buffer != NULL) free(buffer);
+	return success;
 }
 
 char* parse_request(char* request, int length, bool* is_post)
@@ -176,33 +258,37 @@ char* parse_request(char* request, int length, bool* is_post)
 	return strtok(s, " ");
 }
 
-void handle_post_request(int client_fd, const char* path)
+bool handle_post_request(int client_fd, const char* path)
 {
-
+	return FALSE;
 }
 
-void handle_get_request(int client_fd, const char* path)
+bool handle_get_request(int client_fd, const char* path)
 {
-	PRINTF("Get (%s)\n", path);
+	bool success = FALSE;
 	struct stat path_stat;
+	int fd = -1;
+	char* buffer = NULL;
+	PRINTF("Get (%s)\n", path);
+
 	if (stat(path, &path_stat) == -1) {
 		if (errno == ENOENT) {
 			// TODO: send 404 not found
 		} else {
 			// TODO: return 500 internal error
 		}
-		return;
+		goto end;
 	}
 
 	// TODO: check if is file / dir
 
-	int fd = open(path, O_RDONLY);
+	fd = open(path, O_RDONLY);
 	if (fd == -1) {
 		// TODO: send 500 internal error
-		return;
+		goto end;
 	}
 
-	char* buffer = (char*)malloc(MEGA);
+	buffer = (char*)malloc(MEGA);
 	VERIFY(buffer != NULL, "malloc failed");
 	int bytes_read = 0;
 	PRINTF("Send file\n");
@@ -217,11 +303,16 @@ void handle_get_request(int client_fd, const char* path)
 		write_all(client_fd, buffer, bytes_read);
 	}
 
-	close(fd);
+	success = TRUE;
+end:
+	if (buffer != NULL) free(buffer);
+	if (fd != -1) close(fd);
+	return success;
 }
 
-void write_all(int fd, void* data, int size)
+bool write_all(int fd, void* data, int size)
 {
+	bool success = FALSE;
 	assert(size >= 0);
 	while (size > 0) {
 		int bytes_written = write(fd, data, size);
@@ -229,4 +320,7 @@ void write_all(int fd, void* data, int size)
 		size -= bytes_written;
 		assert(size >= 0);
 	}
+	success = TRUE;
+end:
+	return success;
 }
