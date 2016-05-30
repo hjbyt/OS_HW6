@@ -79,7 +79,7 @@ typedef int bool;
 
 #define DEFAULT_HTTP_PORT 80
 
-#define REQUEST_MAX_SIZE 8192
+#define REQUEST_MAX_LENGTH 1023
 #define STATUS_LINE_MAX_LENGTH 1024
 
 //
@@ -238,13 +238,12 @@ bool handle_request(int client_fd)
 	bool success = FALSE;
 	char* buffer = NULL;
 
-	buffer = (char*)malloc(REQUEST_MAX_SIZE);
+	buffer = (char*)malloc(REQUEST_MAX_LENGTH);
 	VERIFY(buffer != NULL, "malloc failed");
 
-	int bytes_read = read(client_fd, buffer, REQUEST_MAX_SIZE);
+	int bytes_read = read(client_fd, buffer, REQUEST_MAX_LENGTH);
 	VERIFY(bytes_read != -1, "read from client socket failed");
-	if (bytes_read == REQUEST_MAX_SIZE) {
-		//TODO: is this the right thing to do?
+	if (bytes_read == REQUEST_MAX_LENGTH) {
 		PROPAGATE(send_response(client_fd, 414, "Request-URI Too Large", "Request to long"));
 		success = TRUE;
 		goto end;
