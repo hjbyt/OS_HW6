@@ -22,7 +22,7 @@
 #include <signal.h>
 
 //
-// TODO: - change the special errors (414, 403, etc) to 500 ?
+// TODO: - change the special errors (403, etc) to 500 ?
 //       - implement multiple threads
 //       - return HTML body in all responses?
 //       - what if a 200 OK is sent, but then there is an error reading the file / direcory?
@@ -82,6 +82,22 @@ typedef int bool;
 #define REQUEST_MAX_LENGTH 1023
 #define STATUS_LINE_MAX_LENGTH 1024
 
+
+typedef enum
+{
+	PARSE_SUCCESS,
+	PARSE_BAD_REQUEST,
+	PARSE_UNSUPPORTED_REQUEST,
+} ParseResult ;
+
+const char* SUPPORTED_HTTP_METHODS[] = {
+		"GET", "POST"
+};
+
+const char* UNSUPPORTED_HTTP_METHODS[] = {
+		"OPTIONS", "HEAD", "PUT", "DELETE", "TRACE", "CONNECT"
+};
+
 //
 // Structs
 //
@@ -102,8 +118,8 @@ bool init(int port, int workers_count) WARN_UNUSED;
 void uninit();
 bool serve() WARN_UNUSED;
 bool handle_request(int client_fd) WARN_UNUSED;
-char* parse_request(char* request, int length, bool* is_post);
-bool handle_post_request(int client_fd, const char* path) WARN_UNUSED;
+ParseResult parse_request(char* request, char** path);
+bool is_string_in_array(const char* string, const char** string_array, int array_length);
 bool handle_get_request(int client_fd, const char* path) WARN_UNUSED;
 bool send_file(int client_fd, const char* file_path) WARN_UNUSED;
 bool send_dir_list(int client_fd, const char* dir_path) WARN_UNUSED;
@@ -164,10 +180,6 @@ bool register_signal_handlers()
 	if (sigaction(SIGINT, &kill_action, NULL) == -1) {
 		ERROR("Error, sigaction failed");
 	}
-	//TODO: uncomment?
-//	if (sigaction(SIGTERM, &kill_action, NULL) == -1) {
-//		ERROR("Error, sigaction failed");
-//	}
 
 	success = TRUE;
 
@@ -186,7 +198,6 @@ bool init(int port, int workers_count)
 	bool success = FALSE;
 
 	assert(workers_count >= 1);
-	//TODO: use SO_REUSEADDR ??
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	VERIFY(listen_fd != -1, "create socket failed");
 
@@ -195,6 +206,8 @@ bool init(int port, int workers_count)
 	server_address.sin_family = AF_INET;
 	server_address.sin_addr.s_addr = htonl(INADDR_ANY);
 	server_address.sin_port = htons(port);
+	//TODO: remove setsockopt
+	VERIFY(setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == 0, "setsockopt failed");
 	VERIFY(bind(listen_fd, (struct sockaddr*)&server_address, sizeof(server_address)) != -1, "bind failed");
 	VERIFY(listen(listen_fd, workers_count) != -1, "listen failed");
 
@@ -238,7 +251,7 @@ bool handle_request(int client_fd)
 	bool success = FALSE;
 	char* buffer = NULL;
 
-	buffer = (char*)malloc(REQUEST_MAX_LENGTH);
+	buffer = (char*)malloc(REQUEST_MAX_LENGTH + 1);
 	VERIFY(buffer != NULL, "malloc failed");
 
 	int bytes_read = read(client_fd, buffer, REQUEST_MAX_LENGTH);
@@ -248,20 +261,31 @@ bool handle_request(int client_fd)
 		success = TRUE;
 		goto end;
 	}
+	buffer[bytes_read] = '\0';
+	PRINTF("request: %s", buffer);
 
-	bool is_post;
-	char* path = parse_request(buffer, bytes_read, &is_post);
-	if (path == NULL) {
+	char* path;
+	ParseResult parse_result = parse_request(buffer, &path);
+	switch (parse_result)
+	{
+	case PARSE_SUCCESS:
+		break;
+	case PARSE_BAD_REQUEST:
 		PROPAGATE(send_response(client_fd, 400, "Bad Request", "Bad Request"));
 		success = TRUE;
 		goto end;
+	case PARSE_UNSUPPORTED_REQUEST:
+		PROPAGATE(
+				send_response(client_fd, 501, "Not Implemented",
+						"Request method not implemented"));
+		success = TRUE;
+		goto end;
+	default:
+		assert(FALSE);
 	}
 
-	if (is_post) {
-		PROPAGATE(handle_post_request(client_fd, path));
-	} else {
-		PROPAGATE(handle_get_request(client_fd, path));
-	}
+	//Note: as the instructions specified, post requests are handled just like get requests.
+	PROPAGATE(handle_get_request(client_fd, path));
 
 	success = TRUE;
 end:
@@ -269,28 +293,49 @@ end:
 	return success;
 }
 
-char* parse_request(char* request, int length, bool* is_post)
+ParseResult parse_request(char* request, char** path)
 {
-	assert(is_post != NULL);
 	char* s = request;
-	if (length >=  3 && strncmp("GET ", s, 4) == 0) {
-		s += 4;
-		*is_post = FALSE;
-	} else if (length >= 4 && strncmp("POST ", s, 5) == 0) {
-		s += 5;
-		*is_post = FALSE;
-	} else {
-		return NULL;
-	}
-	//TODO: recognize other http methods, in order to return 501.
-	//TODO: check the HTTP-Version after the URL ?
 
-	return strtok(s, " ");
+	// Parse request method
+	char* method_end = strchr(s, ' ');
+	if (method_end == NULL) {
+		return PARSE_BAD_REQUEST;
+	}
+	*method_end = '\0';
+	char* method = s;
+	s = method_end + 1;
+
+	// Check method
+	if (is_string_in_array(method, UNSUPPORTED_HTTP_METHODS,
+			ARRAY_LENGTH(UNSUPPORTED_HTTP_METHODS))) {
+		return PARSE_UNSUPPORTED_REQUEST;
+	}
+	if (!is_string_in_array(method, SUPPORTED_HTTP_METHODS,
+			ARRAY_LENGTH(SUPPORTED_HTTP_METHODS))) {
+		return PARSE_BAD_REQUEST;
+	}
+
+	// Parse requested path
+	char* path_end = strchr(s, ' ');
+	if (path_end == NULL) {
+		return PARSE_BAD_REQUEST;
+	}
+	*path_end = '\0';
+	*path = s;
+	s = path_end + 1;
+
+	return PARSE_SUCCESS;
 }
 
-bool handle_post_request(int client_fd, const char* path)
+bool is_string_in_array(const char* string, const char** string_array, int array_length)
 {
-	//TODO: implement
+	for (int i = 0; i < array_length; ++i)
+	{
+		if (strcmp(string, string_array[i]) == 0) {
+			return TRUE;
+		}
+	}
 	return FALSE;
 }
 
