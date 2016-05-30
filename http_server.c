@@ -20,10 +20,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <pthread.h>
 
 //
 // TODO: - change the special errors (403, etc) to 500 ?
-//       - implement multiple threads
 //       - return HTML body in all responses?
 //       - what if a 200 OK is sent, but then there is an error reading the file / direcory?
 //         maybe we should prepare the body in advance, and send all at once.
@@ -48,9 +48,17 @@
 	do {                                         \
 		if (!(condition)) {                      \
 			fprintf(stderr, "Error, " msg "\n"); \
-			exit(EXIT_FAILURE);                  \
+			goto end;                            \
 		}                                        \
 	} while (0)
+#define PCHECK(pthread_operation, msg)                               \
+	do {                                                             \
+		int _r = (pthread_operation);                                \
+		if (_r != 0) {                                               \
+			fprintf(stderr, "Error, " msg ": %s \n", strerror(_r));  \
+			goto end;                                                \
+		}                                                            \
+	} while(0)
 // If there is an error, propagate it.
 #define PROPAGATE(condition) if (!(condition)) goto end
 
@@ -82,6 +90,7 @@ typedef int bool;
 #define REQUEST_MAX_LENGTH 1023
 #define STATUS_LINE_MAX_LENGTH 1024
 
+#define MAX_PENDING_REQUESTS_PER_THREAD 16
 
 typedef enum
 {
@@ -102,11 +111,25 @@ const char* UNSUPPORTED_HTTP_METHODS[] = {
 // Structs
 //
 
+typedef struct ClientQueue_t {
+	int* clients;
+	int capacity;
+	int first_client_index;
+	int client_count;
+	pthread_mutex_t mutex;
+	pthread_cond_t not_empty_cond;
+} ClientQueue;
+
 //
 // Globals
 //
 
 int listen_fd = -1;
+ClientQueue clients;
+int thread_count = 0;
+bool should_worker_continue = TRUE;
+pthread_t* threads = NULL;
+bool initialized = FALSE;
 
 //
 // Function Declarations
@@ -114,10 +137,10 @@ int listen_fd = -1;
 
 bool register_signal_handlers() WARN_UNUSED;
 void kill_signal_handler(int signum);
-bool init(int port, int workers_count) WARN_UNUSED;
+void init(int port);
 void uninit();
 bool serve() WARN_UNUSED;
-bool handle_request(int client_fd) WARN_UNUSED;
+bool handle_client(int client_fd) WARN_UNUSED;
 ParseResult parse_request(char* request, char** path);
 bool is_string_in_array(const char* string, const char** string_array, int array_length);
 bool handle_get_request(int client_fd, const char* path) WARN_UNUSED;
@@ -127,6 +150,16 @@ bool send_response(int fd, int status, const char* reason, char* body) WARN_UNUS
 bool send_status_line(int fd, int status, const char* reason) WARN_UNUSED;
 bool write_all(int fd, const void* data, int size) WARN_UNUSED;
 size_t dirent_buf_size(DIR * dirp);
+
+bool init_queue(int capacity) WARN_UNUSED;
+void uninit_queue();
+bool lock_queue() WARN_UNUSED;
+bool unlock_queue() WARN_UNUSED;
+bool is_queue_empty();
+int first_client();
+bool enqueue_client(int client_fd) WARN_UNUSED;
+int dequeue_client();
+void* handle_clients(void* arg);
 
 //
 // Implementation
@@ -141,8 +174,8 @@ int main(int argc, char** argv)
 	}
 
 	errno = 0;
-	int workers_count = strtol(argv[1], NULL, 0);
-	VERIFY(errno == 0 && workers_count >= 1, "Invallid argument given as <workers>");
+	thread_count = strtol(argv[1], NULL, 0);
+	VERIFY(errno == 0 && thread_count >= 1, "Invallid argument given as <workers>");
 	int port;
 	if (argc == 3) {
 		errno = 0;
@@ -152,7 +185,7 @@ int main(int argc, char** argv)
 		port = DEFAULT_HTTP_PORT;
 	}
 
-	PROPAGATE(init(port, workers_count));
+	init(port);
 
 	PRINTF("Server started\n");
 	while (TRUE)
@@ -193,14 +226,23 @@ void kill_signal_handler(int signum)
 	exit(EXIT_SUCCESS);
 }
 
-bool init(int port, int workers_count)
+void init(int port)
 {
-	bool success = FALSE;
+	if (initialized) {
+		uninit();
+	}
 
-	assert(workers_count >= 1);
+	PROPAGATE(init_queue(MAX_PENDING_REQUESTS_PER_THREAD * thread_count));
+
+	threads = (pthread_t*)malloc(sizeof(pthread_t) * thread_count);
+	VERIFY(threads != NULL, "malloc failed");
+	for (int i = 0; i < thread_count; ++i)
+	{
+		PCHECK(pthread_create(&threads[i], NULL, handle_clients, NULL), "create thread failed");
+	}
+
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	VERIFY(listen_fd != -1, "create socket failed");
-
 	struct sockaddr_in server_address;
 	memset(&server_address, 0, sizeof(server_address));
 	server_address.sin_family = AF_INET;
@@ -209,22 +251,42 @@ bool init(int port, int workers_count)
 	//TODO: remove setsockopt
 	VERIFY(setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == 0, "setsockopt failed");
 	VERIFY(bind(listen_fd, (struct sockaddr*)&server_address, sizeof(server_address)) != -1, "bind failed");
-	VERIFY(listen(listen_fd, workers_count) != -1, "listen failed");
+	VERIFY(listen(listen_fd, thread_count) != -1, "listen failed");
 
-	success = TRUE;
+	initialized = TRUE;
 end:
-	if (!success) {
-		uninit();
+	if (!initialized) {
+		exit(EXIT_FAILURE);
 	}
-	return success;
 }
 
 void uninit()
 {
-	if (listen_fd != -1) {
-		close(listen_fd);
-		listen_fd = -1;
+	if (!initialized) {
+		return;
 	}
+
+	close(listen_fd);
+	listen_fd = -1;
+	initialized = FALSE;
+
+	// Signal the workers to finish
+	should_worker_continue = FALSE;
+	PCHECK(pthread_cond_broadcast(&clients.not_empty_cond) == 0, "condition broadcast failed");
+	// Wait for them to actually finish
+	for (int i = 0; i < thread_count; ++i)
+	{
+		PCHECK(pthread_join(threads[i], NULL) == 0, "thread join failed");
+	}
+
+	free(threads);
+	threads = NULL;
+
+	uninit_queue();
+
+	return;
+end:
+	exit(EXIT_FAILURE);
 }
 
 bool serve()
@@ -232,21 +294,20 @@ bool serve()
 	bool success = FALSE;
 	int client_fd = -1;
 
-	PRINTF("wait for connection\n");
 	client_fd = accept(listen_fd, NULL, NULL);
 	VERIFY(client_fd != -1, "accept failed");
 
-	if (!handle_request(client_fd)) {
+	if (!enqueue_client(client_fd)) {
 		PROPAGATE(send_response(client_fd, 500, "Internal Server Error", "Internal Server Error"));
+		close(client_fd);
 	}
 
 	success = TRUE;
 end:
-	if (client_fd != -1) close(client_fd);
 	return success;
 }
 
-bool handle_request(int client_fd)
+bool handle_client(int client_fd)
 {
 	bool success = FALSE;
 	char* buffer = NULL;
@@ -262,7 +323,6 @@ bool handle_request(int client_fd)
 		goto end;
 	}
 	buffer[bytes_read] = '\0';
-	PRINTF("request: %s", buffer);
 
 	char* path;
 	ParseResult parse_result = parse_request(buffer, &path);
@@ -345,6 +405,7 @@ bool handle_get_request(int client_fd, const char* path)
 	struct stat path_stat;
 	PRINTF("Get (%s)\n", path);
 
+	//TODO: handle paths such as "~/Downloads/note.txt" (?)
 	if (stat(path, &path_stat) == -1) {
 		if (errno == ENOENT || errno == ENOTDIR) {
 			//TODO: return simple HTML body?
@@ -545,3 +606,129 @@ size_t dirent_buf_size(DIR * dirp)
     return (name_end > sizeof(struct dirent)
             ? name_end : sizeof(struct dirent));
 }
+
+bool init_queue(int capacity)
+{
+	clients.client_count = 0;
+	clients.first_client_index = 0;
+	clients.capacity = capacity;
+	clients.clients = (int*)malloc(sizeof(int) * clients.capacity);
+	if (clients.clients == NULL) {
+		perror("malloc failed");
+		return FALSE;
+	}
+
+	int r = pthread_mutex_init(&clients.mutex, NULL);
+	if (r != 0) {
+		perror("init mutex failed");
+		free(clients.clients);
+		return FALSE;
+	}
+
+	r = pthread_cond_init(&clients.not_empty_cond, NULL);
+	if (r != 0) {
+		perror("init condition variable failed");
+		pthread_mutex_destroy(&clients.mutex);
+		free(clients.clients);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+void uninit_queue()
+{
+	free(clients.clients);
+	pthread_cond_destroy(&clients.not_empty_cond);
+	pthread_mutex_destroy(&clients.mutex);
+}
+
+bool lock_queue()
+{
+	bool success = FALSE;
+	PCHECK(pthread_mutex_lock(&clients.mutex), "lock mutex failed");
+	success = TRUE;
+end:
+	return success;
+}
+
+bool unlock_queue()
+{
+	bool success = FALSE;
+	PCHECK(pthread_mutex_unlock(&clients.mutex), "unlock mutex failed");
+	success = TRUE;
+end:
+	return success;
+}
+
+bool is_queue_empty()
+{
+	return clients.client_count == 0;
+}
+
+int first_client()
+{
+	return clients.clients[clients.first_client_index];
+}
+
+bool enqueue_client(int client_fd)
+{
+	bool success = FALSE;
+	CHECK(clients.client_count < clients.capacity, "tried to enqueue when the queue is full");
+	int new_task_index = (clients.first_client_index + clients.client_count) % clients.capacity;
+	clients.clients[new_task_index] = client_fd;
+	clients.client_count += 1;
+	//TODO: ???
+//	if (tasks.task_count == 1) {
+		PCHECK(pthread_cond_signal(&clients.not_empty_cond), "condition signal failed");
+//	}
+	success = TRUE;
+end:
+	return success;
+}
+
+int dequeue_client()
+{
+	int client_fd = -1;
+	CHECK(!is_queue_empty(), "tried to dequeue from empty queue");
+	client_fd = first_client();
+	clients.first_client_index = (clients.first_client_index + 1) % clients.capacity;
+	clients.client_count -= 1;
+end:
+	return client_fd;
+}
+
+void* handle_clients(void* arg)
+{
+	int client_fd = -1;
+	while (TRUE)
+	{
+		PROPAGATE(lock_queue());
+		while (is_queue_empty() && should_worker_continue)
+		{
+			PCHECK(pthread_cond_wait(&clients.not_empty_cond, &clients.mutex), "wait on condition variable failed");
+		}
+		if (!should_worker_continue) {
+			PROPAGATE(unlock_queue());
+			return NULL;
+		}
+		int client_fd = dequeue_client();
+		if (client_fd == -1) {
+			PROPAGATE(unlock_queue());
+			goto end;
+		}
+		PROPAGATE(unlock_queue());
+
+		if (!handle_client(client_fd)) {
+			PROPAGATE(send_response(client_fd, 500, "Internal Server Error", "Internal Server Error"));
+		}
+		close(client_fd);
+		client_fd = -1;
+	}
+
+end:
+	// TODO: handle errors??
+	if (client_fd != -1) close(client_fd);
+	return NULL;
+}
+
